@@ -65,6 +65,8 @@ typedef struct osprd_info {
 	/* HINT: You may want to add additional fields to help
 	         in detecting deadlock. */
 
+	unsigned nreadlocks, nwritelocks;
+
 	// The following elements are used internally; you don't need
 	// to understand them.
 	struct request_queue *queue;    // The device request queue.
@@ -158,10 +160,7 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
 		// as appropriate.
 
 		// Your code here.
-
-		// This line avoids compiler warnings; you may remove it.
-		(void) filp_writable, (void) d;
-
+		osprd_ioctl(inode, filp, OSPRDIOCRELEASE, 0);
 	}
 
 	return 0;
@@ -184,9 +183,6 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 
 	// is file open for writing?
 	int filp_writable = (filp->f_mode & FMODE_WRITE) != 0;
-
-	// This line avoids compiler warnings; you may remove it.
-	(void) filp_writable, (void) d;
 
 	// Set 'r' to the ioctl's return value: 0 on success, negative on error
 
@@ -228,8 +224,27 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// be protected by a spinlock; which ones?)
 
 		// Your code here (instead of the next two lines).
-		eprintk("Attempting to acquire\n");
-		r = -ENOTTY;
+		osp_spin_lock(&d->mutex);
+		unsigned my_ticket = d->ticket_head;
+		d->ticket_head++;
+		osp_spin_unlock(&d->mutex);
+		if (wait_event_interruptible(d->blockq,
+					d->ticket_tail == my_ticket
+					&& d->nwritelocks == 0
+					&& (!filp_writable || d->nreadlocks == 0)
+					) == -ERESTARTSYS) {
+			r = -ERESTARTSYS;
+		} else {
+			filp->f_flags |= F_OSPRD_LOCKED;
+			osp_spin_lock(&d->mutex);
+			if (filp_writable) {
+				d->nwritelocks++;
+			} else {
+				d->nreadlocks++;
+			}
+			d->ticket_tail++;
+			osp_spin_unlock(&d->mutex);
+		}
 
 	} else if (cmd == OSPRDIOCTRYACQUIRE) {
 
@@ -254,7 +269,20 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// you need, and return 0.
 
 		// Your code here (instead of the next line).
-		r = -ENOTTY;
+		if ((filp->f_flags & F_OSPRD_LOCKED) == 0) {
+			r = -EINVAL;
+		} else {
+			r = 0;
+			filp->f_flags ^= F_OSPRD_LOCKED;
+			osp_spin_lock(&d->mutex);
+			if (filp_writable) {
+				d->nwritelocks--;
+			} else {
+				d->nreadlocks--;
+			}
+			osp_spin_unlock(&d->mutex);
+			wake_up_all(&d->blockq);
+		}
 
 	} else
 		r = -ENOTTY; /* unknown command */
