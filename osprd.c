@@ -68,6 +68,8 @@ typedef struct osprd_info {
 	unsigned nreadlocks, nwritelocks; // Number of read/write locks
 	pid_t read_locks[OSPRD_MAJOR]; // PID of processes holding read locks
 	pid_t write_lock; // PID of process holding write lock
+	// Processes waiting for (but don't have) read/write lock on this device.
+	pid_t waiting_read[OSPRD_MAJOR], waiting_write[OSPRD_MAJOR];
 	int deadlock; // 1 if deadlock
 
 	// The following elements are used internally; you don't need
@@ -105,39 +107,40 @@ static void for_each_open_file(struct task_struct *task,
 			       osprd_info_t *user_data);
 
 void checkDeadlock(struct file *filp, osprd_info_t *d) {
-	
+	osprd_info_t *mine = file2osprd(filp);
+	if (mine == NULL) {
+		return;
+	}
+	// Do I have a write lock on mine?
+	int mine_writelock = d->nwritelocks == 1;
+
 	int filp_writable = filp->f_mode & FMODE_WRITE;
+	int want_writelock = d->deadlock; // Passed from ioctl()
+	d->deadlock = 0;
 	int i;
 	int j;
-	osprd_info_t *otherDisk;
-	/*
-	if (otherDisk = file2osprd(filp) != NULL) {
-	   
-		// If process is aqcuiring write lock
-		if (filp_writable) { 
-			for (i = 0; i < OSPRD_MAJOR; i++) {
-
-				// If process has read lock on second ramdisk
-				if ( otherDisk->read_locks[i] == current->pid) {
-					for (j = 0; j < OSPRD_MAJOR; j++) {
-
-						// If another process has write lock on the second 
-						// ramdisk and a read lock on first ramdisk 
-						if (otherDisk->nwritelocks = 1
-							&& d->read_locks[j] == otherDisk->write_lock) {
-							d->deadlock = 1;
-							return;
-						}
-						
-					}
-					
-				}
-				
+	// Ensure there is no process holding a lock on d (which I want)
+	// that is waiting for a lock on filp/mine.
+	for (i = 0; i < OSPRD_MAJOR; i++) {
+		// If I want any lock on d, but another process has a write lock on d and is waiting for my lock, deadlock.
+		if (d->write_lock > 0
+			&& ((mine_writelock && d->write_lock == mine->waiting_read[i]) || d->write_lock == mine->waiting_write[i])) {
+			d->deadlock = 1;
+			return;
+		}
+		// If I want a read lock on d and a process has a read lock on d, there is no harm.
+		if (!want_writelock) {
+			continue;
+		}
+		// If I want a write lock on d, but another process has a read lock on d and is waiting for my lock, deadlock.
+		for (j = 0; j < OSPRD_MAJOR; j++) {
+			if (d->read_locks[j] > 0
+				&& ((mine_writelock && d->read_locks[j] == mine->waiting_read[i]) || d->read_locks[j] == mine->waiting_write[i])) {
+				d->deadlock = 1;
+				return;
 			}
 		}
 	}
-	*/
-	return;
 }
 
 /*
@@ -271,13 +274,14 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		}
 		int i;
 		for (i = 0; i < OSPRD_MAJOR; i++) {
-			if (d->read_locks[i] == current->pid) {
+			// Multiple read locks ok, unless we want a write lock as well.
+			if (d->read_locks[i] == current->pid && filp_writable) {
 				osp_spin_unlock(&d->mutex);
 				return -EDEADLK;
 			}
 		}		
 		// Deadlock with 2 processes
-		d->deadlock = 0;
+		d->deadlock = filp_writable; // Pass filp_writable to callback.
 		for_each_open_file(current, checkDeadlock, d);
 		if (d->deadlock) {
 			d->deadlock = 0;
@@ -287,6 +291,20 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		
 		unsigned my_ticket = d->ticket_head;
 		d->ticket_head++;
+		// Add current process to d->waiting_read/write.
+		for (i = 0; i < OSPRD_MAJOR; i++) {
+			if (filp_writable) {
+				if (d->waiting_write[i] > 0) {
+					d->waiting_write[i] = current->pid;
+					break;
+				}
+			} else {
+				if (d->waiting_read[i] > 0) {
+					d->waiting_read[i] = current->pid;
+					break;
+				}
+			}
+		}
 		osp_spin_unlock(&d->mutex);
 		if (wait_event_interruptible(d->blockq,
 					d->ticket_tail == my_ticket
@@ -316,6 +334,20 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 				}
 				d->nreadlocks++;				
 			}
+			// Remove current process from d->waiting_read/write.
+			for (i = 0; i < OSPRD_MAJOR; i++) {
+				if (filp_writable) {
+					if (d->waiting_write[i] == current->pid) {
+						d->waiting_write[i] = -1;
+						break;
+					}
+				} else {
+					if (d->waiting_read[i] == current->pid) {
+						d->waiting_read[i] = -1;
+						break;
+					}
+				}
+			}
 			d->ticket_tail++;
 			osp_spin_unlock(&d->mutex);
 		}
@@ -330,11 +362,11 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// Otherwise, if we can grant the lock request, return 0.
 
 		// Your code here (instead of the next two lines).
+		osp_spin_lock(&d->mutex);
 		if ( d->nwritelocks == 0
 			 && (!filp_writable || d->nreadlocks == 0)
 			 ) {
 			filp->f_flags |= F_OSPRD_LOCKED;
-			osp_spin_lock(&d->mutex);
 			if (filp_writable) {			 
 				d->write_lock = current->pid;
 				d->nwritelocks++;
@@ -352,6 +384,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 			d->ticket_tail++;
 			osp_spin_unlock(&d->mutex);
 		} else {
+			osp_spin_unlock(&d->mutex);
 			r = -EBUSY;			
 		}
  
