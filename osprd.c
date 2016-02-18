@@ -108,14 +108,14 @@ static void for_each_open_file(struct task_struct *task,
 
 void checkDeadlock(struct file *filp, osprd_info_t *d) {
 	osprd_info_t *mine = file2osprd(filp);
-	if (mine == NULL) {
+	// If we already found deadlock, stop.
+	if (mine == NULL || d->deadlock == 1) {
 		return;
 	}
 	// Do I have a write lock on mine?
 	int mine_writelock = d->nwritelocks == 1;
 
-	int filp_writable = filp->f_mode & FMODE_WRITE;
-	int want_writelock = d->deadlock; // Passed from ioctl()
+	int want_writelock = -d->deadlock; // As passed from ioctl()
 	d->deadlock = 0;
 	int i;
 	int j;
@@ -141,6 +141,7 @@ void checkDeadlock(struct file *filp, osprd_info_t *d) {
 			}
 		}
 	}
+	d->deadlock = -want_writelock; // Pass again.
 }
 
 /*
@@ -281,9 +282,9 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 			}
 		}		
 		// Deadlock with 2 processes
-		d->deadlock = filp_writable; // Pass filp_writable to callback.
+		d->deadlock = -filp_writable; // Pass filp_writable to callback.
 		for_each_open_file(current, checkDeadlock, d);
-		if (d->deadlock) {
+		if (d->deadlock == 1) {
 			d->deadlock = 0;
 			osp_spin_unlock(&d->mutex);
 			return -EDEADLK;
@@ -294,12 +295,12 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// Add current process to d->waiting_read/write.
 		for (i = 0; i < OSPRD_MAJOR; i++) {
 			if (filp_writable) {
-				if (d->waiting_write[i] > 0) {
+				if (d->waiting_write[i] <= 0) {
 					d->waiting_write[i] = current->pid;
 					break;
 				}
 			} else {
-				if (d->waiting_read[i] > 0) {
+				if (d->waiting_read[i] <= 0) {
 					d->waiting_read[i] = current->pid;
 					break;
 				}
